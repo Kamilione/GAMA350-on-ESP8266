@@ -1,0 +1,99 @@
+# Compile test: Elgama GAMA 350 (Stoen Operator, Poland) on ESP8266 / Arduino.
+# A complete GAMA 350 telegram is ~583 bytes. The component's internal STOEN
+# buffers are sized from max_telegram_length; 1024 leaves ample headroom.
+# receive_timeout is the idle gap that ends a telegram and must stay below
+# the meter's ~1s send interval (default 200ms).
+substitutions:
+  device_name: test-esp8266-stoen
+
+esphome:
+  name: ${device_name}
+  name_add_mac_suffix: false
+
+esp8266:
+  board: d1_mini
+  framework:
+    version: 3.1.2
+
+wifi:
+  ssid: "test"
+  password: "test12345678"
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI="
+
+ota:
+  platform: esphome
+
+uart:
+  id: uart_bus
+  baud_rate: 115200
+  rx_pin: D7
+  rx_buffer_size: 1024
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+    components: [ dsmr_custom ]
+    refresh: 0s
+
+dsmr_custom:
+  id: dsmr_hub
+  uart_id: uart_bus
+  method: Poland_STOEN
+  # Test key only (32 hex chars = AES-128); use the key from your meter.
+  decryption_key: "00112233445566778899AABBCCDDEEFF"
+  # Optional 8-byte IV prefix for meters that use a real system title
+  # internally while transmitting an empty one (test value).
+  system_title: "454C470000BC614E"
+  max_telegram_length: 1024
+  receive_timeout: 200ms
+  crc_check: false
+
+  custom_obis_sensors:
+    - code: "0-0:1.0.0"
+      name: "Timestamp"
+      type: text_sensor
+    - code: "1-0:1.8.0"
+      name: "Energy Import Total"
+      type: sensor
+      unit_of_measurement: kWh
+      accuracy_decimals: 3
+      device_class: energy
+      state_class: total_increasing
+    - code: "1-0:2.8.0"
+      name: "Energy Export Total"
+      type: sensor
+      unit_of_measurement: kWh
+      accuracy_decimals: 3
+      device_class: energy
+      state_class: total_increasing
+    - code: "1-0:1.7.0"
+      name: "Power Import"
+      type: sensor
+      unit_of_measurement: kW
+      accuracy_decimals: 3
+      device_class: power
+      state_class: measurement
+    - code: "1-0:2.7.0"
+      name: "Power Export"
+      type: sensor
+      unit_of_measurement: kW
+      accuracy_decimals: 3
+      device_class: power
+      state_class: measurement
+
+text_sensor:
+  - platform: dsmr_custom
+    dsmr_custom_hub_id: dsmr_hub
+    identification:
+      name: "P1 Telegram Header"
+
+sensor:
+  - platform: uptime
+    name: "Uptime"

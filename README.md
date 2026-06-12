@@ -206,11 +206,70 @@ dsmr_custom:
   crc_check: true           # Optional, default: true. Perform CRC check on telegrams.
   decryption_key: "YOUR_32_CHAR_HEX_DECRYPTION_KEY" # Optional. For encrypted telegrams.
   # Note: See docs/aes-gcm-implementation-notes.md for technical details on ESP-IDF encryption support
+  method: plain             # Optional, default: "plain". One of: plain, encrypted, Poland_STOEN.
   request_pin: D5           # Optional. GPIO pin for Data Request (RTS). E.g., D5.
   request_interval: "10s"   # Optional, default: "0s". Interval for active data requests.
   gas_mbus_id: 1            # Optional, default: 1. M-Bus channel ID for standard gas meter.
   water_mbus_id: 2          # Optional, default: 2. M-Bus channel ID for standard water meter.
 ```
+
+#### Polish Elgama GAMA 350 meters (Stoen Operator): `method: Poland_STOEN`
+
+The Elgama GAMA 350 used by Stoen Operator (Warsaw, Poland) sends a DSMR-style
+envelope (`/EGM5G35` header, `!XXXX` footer) wrapping an AES-128-GCM encrypted
+DLMS payload; a complete telegram is ~583 bytes. The component's internal
+receive buffers are sized from `max_telegram_length` (1024 is ample and keeps
+RAM usage low on the ESP8266). Set `method: Poland_STOEN` together with the
+meter's `decryption_key` to decode it.
+
+**Important:** in this mode `receive_timeout` is the *idle gap that marks the
+end of a telegram*, not a patience limit — it must stay **below** the meter's
+~1 s send interval. Keep the 200 ms default; values above 500 ms log a setup
+warning, because telegrams would accumulate until the receive buffer
+overflows. Values are published through
+`custom_obis_sensors` and the full-telegram text sensor; the standard DSMR
+field parser is bypassed for this telegram dialect. Works on ESP8266 (Arduino
+framework, software AES via rweather/Crypto) and on ESP-IDF (hardware
+accelerated MbedTLS). Ported from the
+[BAJO_STOEN](https://github.com/BJozwiak/dsmr-custom/tree/BAJO_STOEN) branch by
+@BJozwiak.
+
+```yaml
+uart:
+  id: uart_bus
+  baud_rate: 115200
+  rx_pin: D7
+  rx_buffer_size: 1024   # a complete GAMA 350 telegram is ~583 bytes
+
+dsmr_custom:
+  id: dsmr_hub
+  uart_id: uart_bus
+  method: Poland_STOEN
+  decryption_key: !secret meter_encryption_key  # 32 hex chars (AES-128)
+  # system_title: "454C470000BC614E"  # optional, 16 hex chars - see below
+  max_telegram_length: 1024  # sizes the internal STOEN buffers
+  receive_timeout: 200ms     # idle gap ending a telegram; keep BELOW the ~1s send interval
+  crc_check: false
+  custom_obis_sensors:
+    - code: "1-0:1.8.0"
+      name: "Energy Import Total"
+      type: sensor
+      unit_of_measurement: kWh
+      accuracy_decimals: 3
+      device_class: energy
+      state_class: total_increasing
+```
+
+See `test-configs/test-arduino-esp8266-stoen.yaml` for a complete example.
+
+**If decryption produces garbage** (the log shows `Decrypted payload is not
+readable text`): the AES-GCM IV is built from an 8-byte *system title* plus
+the frame counter. The GAMA 350 transmits an empty system title and the
+component substitutes zeros, but some meters use their real, serial-derived
+title internally. Use `scripts/try_decrypt.py` on a PC to find the right
+value from one captured telegram, your key, and the meter serial — then set
+it via the optional `system_title:` (16 hex chars). Also try swapping the
+EK/AK keys: operator labels are sometimes reversed.
 
 #### User-Defined OBIS Sensors (`custom_obis_sensors:`)
 

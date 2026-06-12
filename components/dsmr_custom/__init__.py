@@ -63,6 +63,16 @@ CONF_MAX_TELEGRAM_LENGTH = "max_telegram_length"
 CONF_CRC_CHECK = "crc_check"
 CONF_GAS_MBUS_ID = "gas_mbus_id"
 CONF_WATER_MBUS_ID = "water_mbus_id"
+CONF_METHOD = "method"
+
+# Telegram reception/decoding methods. "plain" and "encrypted" preserve the
+# original behaviour (selected implicitly by the presence of decryption_key).
+# "poland_stoen" enables Elgama GAMA 350 (Stoen Operator, Poland) support.
+METHODS = {
+    "plain": "plain",
+    "encrypted": "encrypted",
+    "poland_stoen": "poland_stoen",
+}
 
 CONF_CUSTOM_OBIS_SENSORS = "custom_obis_sensors"
 CONF_OBIS_CODE = "code"
@@ -90,6 +100,25 @@ def _validate_key(value):
     return "".join(f"{part:02X}" for part in parts_int)
 
 
+CONF_SYSTEM_TITLE = "system_title"
+
+
+def _validate_system_title(value):
+    value = cv.string_strict(value)
+    if not value:
+        return ""
+    if len(value) != 16:
+        raise cv.Invalid(
+            "system_title must be 16 hexadecimal characters (8 bytes), "
+            f"got {len(value)} characters."
+        )
+    try:
+        int(value, 16)
+    except ValueError:
+        raise cv.Invalid("system_title must be hexadecimal.")
+    return value.upper()
+
+
 CUSTOM_OBIS_SENSOR_SCHEMA = cv.Schema({
     cv.Required(CONF_OBIS_CODE): cv.string_strict,
     cv.Required(CONF_NAME): cv.string_strict,
@@ -105,25 +134,39 @@ CUSTOM_OBIS_SENSOR_SCHEMA = cv.Schema({
     cv.Optional(CONF_INTERNAL, default=False): cv.boolean,
 })
 
-CONFIG_SCHEMA = cv.Schema(
-    {
-        cv.GenerateID(): cv.declare_id(Dsmr),
-        cv.Optional(CONF_MAX_TELEGRAM_LENGTH, default=1500): cv.positive_int,
-        cv.Optional(CONF_DECRYPTION_KEY): _validate_key,
-        cv.Optional(CONF_REQUEST_PIN): pins.gpio_output_pin_schema,
-        cv.Optional(CONF_REQUEST_INTERVAL, default="0s"): cv.positive_time_period_milliseconds,
-        cv.Optional(CONF_RECEIVE_TIMEOUT, default="200ms"): cv.positive_time_period_milliseconds,
-        cv.Optional(CONF_CRC_CHECK, default=True): cv.boolean,
-        cv.Optional(CONF_GAS_MBUS_ID, default=1): cv.int_range(min=0, max=255),
-        cv.Optional(CONF_WATER_MBUS_ID, default=2): cv.int_range(min=0, max=255),
-        cv.Optional(CONF_CUSTOM_OBIS_SENSORS): cv.ensure_list(CUSTOM_OBIS_SENSOR_SCHEMA),
-        cv.Optional(CONF_PLATFORMIO_OPTIONS, default={}): cv.Schema(
-            {
-                cv.Optional("lib_deps"): cv.ensure_list(cv.string_strict),
-            }
-        ),
-    }
-).extend(uart.UART_DEVICE_SCHEMA).extend(cv.COMPONENT_SCHEMA)
+def _validate_method_requirements(config):
+    if config[CONF_METHOD] == "poland_stoen" and CONF_DECRYPTION_KEY not in config:
+        raise cv.Invalid(
+            "method: Poland_STOEN requires 'decryption_key' to be set "
+            "(AES-128-GCM key of the meter)."
+        )
+    return config
+
+
+CONFIG_SCHEMA = cv.All(
+    cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(Dsmr),
+            cv.Optional(CONF_MAX_TELEGRAM_LENGTH, default=1500): cv.positive_int,
+            cv.Optional(CONF_DECRYPTION_KEY): _validate_key,
+            cv.Optional(CONF_SYSTEM_TITLE): _validate_system_title,
+            cv.Optional(CONF_METHOD, default="plain"): cv.enum(METHODS, lower=True),
+            cv.Optional(CONF_REQUEST_PIN): pins.gpio_output_pin_schema,
+            cv.Optional(CONF_REQUEST_INTERVAL, default="0s"): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_RECEIVE_TIMEOUT, default="200ms"): cv.positive_time_period_milliseconds,
+            cv.Optional(CONF_CRC_CHECK, default=True): cv.boolean,
+            cv.Optional(CONF_GAS_MBUS_ID, default=1): cv.int_range(min=0, max=255),
+            cv.Optional(CONF_WATER_MBUS_ID, default=2): cv.int_range(min=0, max=255),
+            cv.Optional(CONF_CUSTOM_OBIS_SENSORS): cv.ensure_list(CUSTOM_OBIS_SENSOR_SCHEMA),
+            cv.Optional(CONF_PLATFORMIO_OPTIONS, default={}): cv.Schema(
+                {
+                    cv.Optional("lib_deps"): cv.ensure_list(cv.string_strict),
+                }
+            ),
+        }
+    ).extend(uart.UART_DEVICE_SCHEMA).extend(cv.COMPONENT_SCHEMA),
+    _validate_method_requirements,
+)
 
 
 async def to_code(config):
@@ -131,10 +174,13 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID], uart_var, config[CONF_CRC_CHECK])
     await cg.register_component(var, config)
 
-    # Platform-specific crypto library configuration
+    # Platform-specific crypto library configuration.
+    # CORE.using_arduino (not the deprecated CORE.using_esp_idf) so that
+    # ESP32 Arduino-on-IDF builds keep getting the Crypto library - this
+    # mirrors the USE_ARDUINO / USE_ESP_IDF guards in the C++ sources.
     from esphome.core import CORE
-    if not CORE.using_esp_idf:
-        # Arduino: Use rweather/Crypto library
+    if CORE.using_arduino:
+        # Arduino (ESP8266/ESP32): use the rweather/Crypto library
         cg.add_library("rweather/Crypto", "0.4.0")
     else:
         # ESP-IDF: Uses system MbedTLS - configure linker via extra_scripts
@@ -153,9 +199,15 @@ async def to_code(config):
 
     cg.add(var.set_max_telegram_length(config[CONF_MAX_TELEGRAM_LENGTH]))
     cg.add(var.set_receive_timeout(config[CONF_RECEIVE_TIMEOUT].total_milliseconds))
+    # set_method must run before set_decryption_key so the Poland_STOEN mode
+    # can skip allocating the crypt_telegram_ buffer (RAM saving on ESP8266).
+    cg.add(var.set_method(config[CONF_METHOD]))
 
     if CONF_DECRYPTION_KEY in config:
          cg.add(var.set_decryption_key(config[CONF_DECRYPTION_KEY]))
+
+    if CONF_SYSTEM_TITLE in config and config[CONF_SYSTEM_TITLE]:
+        cg.add(var.set_system_title(config[CONF_SYSTEM_TITLE]))
 
     if CONF_REQUEST_PIN in config:
         request_pin_obj = await cg.gpio_pin_expression(config[CONF_REQUEST_PIN])

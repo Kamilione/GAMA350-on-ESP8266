@@ -7,3 +7,9 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 *.log
+
+
+/_bajo_reference/
+
+*.iml
+/.idea/

@@ -155,10 +155,17 @@ void Dsmr::setup() {
     this->request_pin_->digital_write(false);
     LOG_PIN("  Request Pin: ", this->request_pin_);
   }
+  if (this->method_ == Method::POLAND_STOEN) {
+    this->stoen_setup_();
+  }
 }
 
 void Dsmr::loop() {
   if (this->ready_to_request_data_()) {
+    if (this->method_ == Method::POLAND_STOEN) {
+      this->receive_stoen_telegram_();
+      return;
+    }
     if (this->decryption_key_.empty()) {
       this->receive_telegram_();
     } else {
@@ -327,6 +334,9 @@ void Dsmr::reset_telegram_() {
   }
   this->crypt_bytes_read_ = 0;
   this->crypt_telegram_len_ = 0;
+  if (this->method_ == Method::POLAND_STOEN) {
+    this->stoen_reset_telegram_();
+  }
 }
 
 void Dsmr::receive_telegram_() {
@@ -705,22 +715,32 @@ bool Dsmr::parse_telegram() {
              this->max_telegram_len_);
   }
 
-  ::dsmr::ParseResult<void> standard_parse_result = ::dsmr::P1Parser::parse(
-      &data_from_standard_parser, this->telegram_, this->bytes_read_,
-      false /* unknown_error */, this->crc_check_);
-
-  if (standard_parse_result
-          .err_) { // CORRECTED: Access err_ (from ver4_parser_lib_parser.h
-                   // via ver3_parser_lib_util.h)
-    auto err_str = standard_parse_result.fullError(
-        this->telegram_, this->telegram_ + this->bytes_read_);
-    ESP_LOGW(TAG, "DSMR P1 vendored parser error: %s", err_str.c_str());
-    this->status_set_warning();
+  bool standard_fields_ok = true;
+  if (this->method_ == Method::POLAND_STOEN) {
+    // The decrypted GAMA 350 payload does not follow the DSMR dialect the
+    // vendored parser expects; values are published via custom OBIS sensors
+    // and the full-telegram text sensor instead (as in the BAJO_STOEN
+    // reference implementation).
+    ESP_LOGV(TAG, "Skipping vendored P1 parser for Poland_STOEN telegram.");
   } else {
-    ESP_LOGD(TAG, "Successfully parsed P1 telegram using vendored parser for "
-                  "standard fields.");
-    this->status_clear_warning();
-    this->publish_sensors(data_from_standard_parser);
+    ::dsmr::ParseResult<void> standard_parse_result = ::dsmr::P1Parser::parse(
+        &data_from_standard_parser, this->telegram_, this->bytes_read_,
+        false /* unknown_error */, this->crc_check_);
+
+    if (standard_parse_result
+            .err_) { // CORRECTED: Access err_ (from ver4_parser_lib_parser.h
+                     // via ver3_parser_lib_util.h)
+      auto err_str = standard_parse_result.fullError(
+          this->telegram_, this->telegram_ + this->bytes_read_);
+      ESP_LOGW(TAG, "DSMR P1 vendored parser error: %s", err_str.c_str());
+      this->status_set_warning();
+      standard_fields_ok = false;
+    } else {
+      ESP_LOGD(TAG, "Successfully parsed P1 telegram using vendored parser for "
+                    "standard fields.");
+      this->status_clear_warning();
+      this->publish_sensors(data_from_standard_parser);
+    }
   }
 
   ESP_LOGV(TAG, "Processing telegram for custom OBIS sensors line by line.");
@@ -775,7 +795,7 @@ bool Dsmr::parse_telegram() {
     ESP_LOGV(TAG, "Published full telegram to s_telegram_ text_sensor.");
   }
   this->stop_requesting_data_();
-  return !standard_parse_result.err_; // CORRECTED: Access err_
+  return standard_fields_ok;
 }
 
 void Dsmr::publish_sensors(MyData &data) {
@@ -820,6 +840,10 @@ void Dsmr::dump_config() {
                 this->max_telegram_len_);
   ESP_LOGCONFIG(TAG, "  Receive Timeout: %u ms", this->receive_timeout_);
   ESP_LOGCONFIG(TAG, "  CRC Check Enabled: %s", YESNO(this->crc_check_));
+  ESP_LOGCONFIG(TAG, "  Method: %s",
+                this->method_ == Method::POLAND_STOEN ? "Poland_STOEN"
+                : this->method_ == Method::ENCRYPTED  ? "encrypted"
+                                                      : "plain");
   if (this->request_pin_ != nullptr) {
     LOG_PIN("  Request Pin: ", this->request_pin_);
     ESP_LOGCONFIG(TAG, "  Request Interval: %u ms", this->request_interval_);
@@ -914,6 +938,11 @@ void Dsmr::set_decryption_key(const std::string &decryption_key_hex) {
                              decryption_key_hex[i * 2 + 1], '\0'};
     this->decryption_key_[i] =
         static_cast<uint8_t>(std::strtoul(temp_hex_pair, nullptr, 16));
+  }
+  if (this->method_ == Method::POLAND_STOEN) {
+    // Poland_STOEN uses its own (smaller) buffers; skip crypt_telegram_ to
+    // save RAM on the ESP8266.
+    return;
   }
   if (this->crypt_telegram_ == nullptr) {
     this->crypt_telegram_ = new uint8_t[this->max_telegram_len_ + 1];

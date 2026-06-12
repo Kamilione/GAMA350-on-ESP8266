@@ -13,6 +13,7 @@ jobs:
       matrix:
         test-config:
           - test-arduino-esp8266.yaml
+          - test-arduino-esp8266-stoen.yaml
           - test-espidf-esp32.yaml
           - test-espidf-esp32c6.yaml
     

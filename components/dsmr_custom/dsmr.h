@@ -56,6 +56,7 @@
     #include <vector>
     #include <string>
     #include <cmath>
+    #include <cstdlib>
     #include <map>
 
     namespace esphome {
@@ -92,6 +93,19 @@
       TEXT
     };
 
+    /**
+     * @brief Telegram reception/decoding method.
+     * @details PLAIN and ENCRYPTED preserve the original behaviour (selected
+     * implicitly by the presence of a decryption key). POLAND_STOEN enables
+     * support for the Elgama GAMA 350 meter (Stoen Operator, Poland), which
+     * wraps an AES-128-GCM encrypted DLMS payload in a DSMR-style envelope.
+     */
+    enum class Method : uint8_t {
+      PLAIN = 0,
+      ENCRYPTED = 1,
+      POLAND_STOEN = 2,
+    };
+
     struct CustomObisSensorDefinition {
       std::string obis_code_str;
       esphome::sensor::Sensor *numeric_sensor_ptr{nullptr};
@@ -115,6 +129,29 @@
       void publish_sensors(MyData &data);
 
       void set_decryption_key(const std::string &decryption_key);
+      void set_method(const std::string &method) {
+        if (method == "poland_stoen") {
+          this->method_ = Method::POLAND_STOEN;
+        } else if (method == "encrypted") {
+          this->method_ = Method::ENCRYPTED;
+        } else {
+          this->method_ = Method::PLAIN;
+        }
+      }
+      // Optional 8-byte DLMS system title (16 hex chars) used as the first
+      // half of the AES-GCM IV when the meter sends an empty system title in
+      // the frame (Poland_STOEN). Defaults to zeros when unset.
+      void set_system_title(const std::string &system_title_hex) {
+        this->system_title_.clear();
+        if (system_title_hex.length() == 16) {
+          for (int i = 0; i < 8; i++) {
+            char hex_pair[3] = {system_title_hex[i * 2],
+                                system_title_hex[i * 2 + 1], '\0'};
+            this->system_title_.push_back(
+                static_cast<uint8_t>(std::strtoul(hex_pair, nullptr, 16)));
+          }
+        }
+      }
       void set_max_telegram_length(size_t length) { this->max_telegram_len_ = length; }
       void set_request_pin(GPIOPin *request_pin) { this->request_pin_ = request_pin; }
       void set_request_interval(uint32_t interval) { this->request_interval_ = interval; }
@@ -151,6 +188,13 @@
       void receive_telegram_();
       void receive_encrypted_telegram_();
       void reset_telegram_();
+
+      // Poland_STOEN (Elgama GAMA 350) support, implemented in dsmr_stoen.cpp.
+      void stoen_setup_();
+      void stoen_reset_telegram_();
+      void receive_stoen_telegram_();
+      void process_stoen_telegram_();
+      bool decrypt_stoen_telegram_();
       bool available_within_timeout_();
       bool request_interval_reached_();
       bool receive_timeout_reached_();
@@ -188,7 +232,36 @@
       DSMR_CUSTOM_TEXT_SENSOR_LIST(DSMR_DECLARE_STANDARD_TEXT_SENSOR, )
 
       std::vector<uint8_t> decryption_key_{};
+      std::vector<uint8_t> system_title_{};
       bool crc_check_{true};
+
+      Method method_{Method::PLAIN};
+
+      // Poland_STOEN buffers and state. All three buffers (raw RX, encrypted
+      // body, decrypted output) are sized from max_telegram_length, so the
+      // existing YAML option is the single knob for telegram capacity. The
+      // raw telegram must fit max_telegram_length anyway, because the
+      // envelope and body are staged in telegram_ during parsing. A complete
+      // GAMA 350 telegram is ~583 bytes, so max_telegram_length: 1024 is
+      // ample. Buffers are only allocated when method: Poland_STOEN is set.
+      static constexpr size_t STOEN_HEADER_MAX_LEN = 20;
+      static constexpr size_t STOEN_FOOTER_MAX_LEN = 20;
+      static constexpr size_t STOEN_GCM_TAG_LEN = 12;
+
+      size_t stoen_buffer_size_{0};
+      uint8_t *stoen_rx_buffer_{nullptr};
+      size_t stoen_rx_len_{0};
+      uint32_t stoen_last_receive_time_{0};
+      char *stoen_header_{nullptr};
+      bool stoen_header_completed_{false};
+      bool stoen_empty_line_completed_{false};
+      size_t stoen_body_pos_{0};
+      uint8_t *stoen_body_{nullptr};
+      size_t stoen_body_bytes_{0};
+      char *stoen_footer_{nullptr};
+      bool stoen_footer_completed_{false};
+      char *stoen_decrypted_{nullptr};
+      size_t stoen_decrypted_bytes_{0};
 
       std::vector<CustomObisSensorDefinition> custom_obis_definitions_;
 
